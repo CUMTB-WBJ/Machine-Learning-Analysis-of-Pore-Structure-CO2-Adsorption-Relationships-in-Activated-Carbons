@@ -1,0 +1,243 @@
+# -*- coding: utf-8 -*-
+import os
+import numpy as np
+import pandas as pd
+import chardet
+
+from sklearn.model_selection import train_test_split, RepeatedKFold
+from sklearn.metrics import r2_score, mean_squared_error
+from sklearn.preprocessing import StandardScaler
+import xgboost as xgb
+
+# =========================
+# 1) 路径设置
+# =========================
+INPUT_CSV = r"C:\Users\26611\Desktop\ml\S\data.csv"
+
+OUT_DIR = r"C:\Users\26611\Desktop\ml\DIERCI\ML_FIG\XGB\PSD_VMI_DATA"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+# =========================
+# 2) 工具函数
+# =========================
+def rmse(y_true, y_pred):
+    try:
+        return mean_squared_error(y_true, y_pred, squared=False)
+    except TypeError:
+        return float(np.sqrt(mean_squared_error(y_true, y_pred)))
+
+def safe_read_csv(file_path: str) -> pd.DataFrame:
+    with open(file_path, "rb") as f:
+        enc = chardet.detect(f.read(3000)).get("encoding", "utf-8")
+    return pd.read_csv(file_path, encoding=enc)
+
+def build_xgb_model(use_gpu: bool = True) -> xgb.XGBRegressor:
+    params = dict(
+        n_estimators=500,
+        learning_rate=0.05,
+        max_depth=6,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        random_state=42,
+        verbosity=0
+    )
+    if use_gpu:
+        params.update(dict(tree_method="gpu_hist", predictor="gpu_predictor"))
+    else:
+        params.update(dict(tree_method="hist", predictor="auto"))
+    return xgb.XGBRegressor(**params)
+
+# =========================
+# 3) 读取 + 特征工程（PSD / VMI；其余保持原逻辑）
+# =========================
+df = safe_read_csv(INPUT_CSV)
+df.columns = df.columns.str.strip()
+
+pore_cols = ['0.3_0.4', '0.5_0.6', '0.6_0.7', '0.7_0.8', '0.8_0.9', '0.9_1.0']
+base_features = ['SBET', 'VT', 'VMI', 'T', 'P']
+target = 'CO2'
+
+need_cols = base_features + pore_cols + [target]
+for c in need_cols:
+    if c not in df.columns:
+        raise ValueError(f"缺少必要列：{c}")
+
+# 转数值
+df[need_cols] = df[need_cols].apply(pd.to_numeric, errors='coerce')
+
+# ---- 核心修改：孔径分布改为 PSD/VMI（微孔体积为 0 则置 NaN，避免除零）----
+VMI_safe = df["VMI"].replace(0, np.nan)
+pore_div_vmi = df[pore_cols].div(VMI_safe, axis=0)
+
+# 派生特征：VMI/VT（保留）
+df['VMI_VT'] = df['VMI'] / df['VT']
+
+# 删除缺失/无穷
+df.replace([np.inf, -np.inf], np.nan, inplace=True)
+# 注意：这里必须同时要求 PSD/VMI 不缺失
+df.dropna(subset=base_features + pore_cols + ['VMI_VT', target], inplace=True)
+
+# 组装 X, y：base + (PSD/VMI) + VMI_VT
+X = df[base_features].copy()
+X[pore_cols] = pore_div_vmi
+X['VMI_VT'] = df['VMI_VT']
+y = df[target].astype(float)
+
+# 再次清理（确保 PSD/VMI 的 NaN 被过滤）
+X = X.replace([np.inf, -np.inf], np.nan)
+mask = X.notna().all(axis=1) & y.notna()
+X = X.loc[mask].copy()
+y = y.loc[mask].copy()
+
+# 标准化（保持你原脚本逻辑：标准化后训练）
+scaler = StandardScaler()
+X_scaled = pd.DataFrame(scaler.fit_transform(X), columns=X.columns, index=X.index)
+
+# =========================
+# 4) Train/Test split + 拟合（用于性能图数据）
+# =========================
+X_train, X_test, y_train, y_test = train_test_split(
+    X_scaled, y, test_size=0.2, random_state=42
+)
+
+# 优先 GPU，失败则 CPU
+try:
+    model = build_xgb_model(use_gpu=True)
+    model.fit(X_train, y_train)
+except Exception as e:
+    print("[提示] GPU 训练失败，自动切换为 CPU。原因：", str(e))
+    model = build_xgb_model(use_gpu=False)
+    model.fit(X_train, y_train)
+
+y_train_pred = model.predict(X_train)
+y_test_pred  = model.predict(X_test)
+
+train_r2 = float(r2_score(y_train, y_train_pred))
+test_r2  = float(r2_score(y_test,  y_test_pred))
+train_rmse = float(rmse(y_train, y_train_pred))
+test_rmse  = float(rmse(y_test,  y_test_pred))
+
+print(f"Train R²: {train_r2:.4f}, RMSE={train_rmse:.3f}")
+print(f"Test  R²: {test_r2:.4f}, RMSE={test_rmse:.3f}")
+
+# 拟合线参数（Pred = k*True + b）
+k_tr, b_tr = np.polyfit(np.asarray(y_train), np.asarray(y_train_pred), 1)
+k_te, b_te = np.polyfit(np.asarray(y_test),  np.asarray(y_test_pred),  1)
+
+# 生成 parity 用的 x 范围（给 Origin 画三条线用）
+x_all = np.concatenate([y_train.values, y_test.values, y_train_pred, y_test_pred])
+xy_min, xy_max = float(np.min(x_all)), float(np.max(x_all))
+pad = 0.05 * (xy_max - xy_min) if xy_max > xy_min else 1.0
+x_min, x_max = xy_min - pad, xy_max + pad
+xx = np.linspace(x_min, x_max, 200)
+
+# =========================
+# 5) (a) 5折×10次 RepeatedKFold（用于 R2-RMSE-STD 散点数据）
+# =========================
+cv = RepeatedKFold(n_splits=5, n_repeats=10, random_state=123)
+r2_list, rmse_list, std_list = [], [], []
+
+for tr_idx, te_idx in cv.split(X_scaled):
+    X_tr, X_te = X_scaled.iloc[tr_idx], X_scaled.iloc[te_idx]
+    y_tr, y_te = y.iloc[tr_idx], y.iloc[te_idx]
+
+    try:
+        m = build_xgb_model(use_gpu=True)
+        m.fit(X_tr, y_tr)
+    except Exception:
+        m = build_xgb_model(use_gpu=False)
+        m.fit(X_tr, y_tr)
+
+    y_hat = m.predict(X_te)
+
+    r2_list.append(float(r2_score(y_te, y_hat)))
+    rmse_list.append(float(rmse(y_te, y_hat)))
+    std_list.append(float(np.std(y_te - y_hat)))
+
+r2_arr = np.array(r2_list, dtype=float)
+rmse_arr = np.array(rmse_list, dtype=float)
+std_arr = np.array(std_list, dtype=float)
+
+r2_mean, r2_std     = float(r2_arr.mean()),  float(r2_arr.std(ddof=1))
+rmse_mean, rmse_std = float(rmse_arr.mean()), float(rmse_arr.std(ddof=1))
+std_mean, std_std   = float(std_arr.mean()),  float(std_arr.std(ddof=1))
+
+# =========================
+# 6) 输出 CSV（只输出交叉验证 + 性能图相关）
+# =========================
+
+# (a) CV 点数据：R2, RMSE, STD
+cv_points = pd.DataFrame({
+    "R2": r2_arr,
+    "RMSE": rmse_arr,
+    "STD": std_arr
+})
+cv_points.to_csv(
+    os.path.join(OUT_DIR, "A_cv_R2_RMSE_STD_points.csv"),
+    index=False, encoding="utf-8-sig"
+)
+
+# (a) CV 汇总数据：均值±标准差
+cv_summary = pd.DataFrame([{
+    "R2_mean": r2_mean, "R2_std": r2_std,
+    "RMSE_mean": rmse_mean, "RMSE_std": rmse_std,
+    "STD_mean": std_mean, "STD_std": std_std,
+    "n_splits": 5, "n_repeats": 10, "n_points": int(len(cv_points))
+}])
+cv_summary.to_csv(
+    os.path.join(OUT_DIR, "A_cv_R2_RMSE_STD_summary.csv"),
+    index=False, encoding="utf-8-sig"
+)
+
+# (d) parity 点数据：True vs Pred + Set
+parity_points = pd.concat([
+    pd.DataFrame({"True_CO2": y_train.values, "Pred_CO2": y_train_pred, "Set": "Train"}),
+    pd.DataFrame({"True_CO2": y_test.values,  "Pred_CO2": y_test_pred,  "Set": "Test"})
+], ignore_index=True)
+parity_points.to_csv(
+    os.path.join(OUT_DIR, "D_parity_points_train_test.csv"),
+    index=False, encoding="utf-8-sig"
+)
+
+# (d) parity 三条线数据：Ideal / TrainFit / TestFit（用于 Origin 直接画线，拉满坐标轴）
+parity_lines = pd.DataFrame({
+    "x": xx,
+    "Ideal_y": xx,
+    "TrainFit_y": k_tr * xx + b_tr,
+    "TestFit_y":  k_te * xx + b_te
+})
+parity_lines.to_csv(
+    os.path.join(OUT_DIR, "D_parity_lines_ideal_trainfit_testfit.csv"),
+    index=False, encoding="utf-8-sig"
+)
+
+# (d) parity 指标 + 拟合参数
+parity_metrics = pd.DataFrame([{
+    "Train_R2": train_r2, "Train_RMSE": train_rmse, "Train_k": float(k_tr), "Train_b": float(b_tr),
+    "Test_R2":  test_r2,  "Test_RMSE":  test_rmse,  "Test_k":  float(k_te), "Test_b":  float(b_te),
+    "Axis_xmin_suggest": float(x_min), "Axis_xmax_suggest": float(x_max)
+}])
+parity_metrics.to_csv(
+    os.path.join(OUT_DIR, "D_parity_metrics_and_fitparams.csv"),
+    index=False, encoding="utf-8-sig"
+)
+
+# 简短说明（可删）
+with open(os.path.join(OUT_DIR, "README_used_files.txt"), "w", encoding="utf-8") as f:
+    f.write("用于作图的CSV说明（Origin）\n")
+    f.write("1) A_cv_R2_RMSE_STD_points.csv：CV散点（X=R2, Y=RMSE, 颜色=STD）\n")
+    f.write("2) A_cv_R2_RMSE_STD_summary.csv：CV均值±标准差（放图内文本框）\n")
+    f.write("3) D_parity_points_train_test.csv：性能散点（True_CO2 vs Pred_CO2，Set区分Train/Test）\n")
+    f.write("4) D_parity_lines_ideal_trainfit_testfit.csv：三条线（Ideal、Train拟合、Test拟合）\n")
+    f.write("5) D_parity_metrics_and_fitparams.csv：R2/RMSE + k,b（写图注/文本/函数线）\n")
+    f.write("\n[特征说明]\n")
+    f.write("本版本将孔径分布特征改为 PSD/VMI（微孔体积归一化），其余特征保持：SBET, VT, VMI, T, P, VMI_VT。\n")
+
+print("\n✅ 已输出（不画图）交叉验证 + 性能图 CSV 到：")
+print(OUT_DIR)
+print("\n输出文件：")
+print(" - A_cv_R2_RMSE_STD_points.csv")
+print(" - A_cv_R2_RMSE_STD_summary.csv")
+print(" - D_parity_points_train_test.csv")
+print(" - D_parity_lines_ideal_trainfit_testfit.csv")
+print(" - D_parity_metrics_and_fitparams.csv")
