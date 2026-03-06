@@ -1,0 +1,282 @@
+# -*- coding: utf-8 -*-
+import os
+import warnings
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
+import shap
+import chardet
+
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import train_test_split, RepeatedKFold
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+
+# ===================== 0) 输出目录（只输出 CSV，不出图片） =====================
+OUT_DIR = r"C:\Users\26611\Desktop\ml\DIERCI\ML_FIG\RF\PSD_DATA"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+# ===================== 1) 工具函数 =====================
+def rmse(y_true, y_pred):
+    return float(np.sqrt(mean_squared_error(y_true, y_pred)))
+
+def fit_line(x, y):
+    """y = kx + b"""
+    k, b = np.polyfit(np.asarray(x, dtype=float), np.asarray(y, dtype=float), 1)
+    return float(k), float(b)
+
+# ===================== 2) 读取数据 =====================
+file_path = r"C:\Users\26611\Desktop\ml\S\data.csv"
+with open(file_path, "rb") as f:
+    encoding = chardet.detect(f.read(20000)).get("encoding", "utf-8")
+df = pd.read_csv(file_path, encoding=encoding)
+df.columns = df.columns.str.strip()
+
+# ===================== 3) 特征定义与清洗 =====================
+pore_cols     = ['0.3_0.4', '0.5_0.6', '0.6_0.7', '0.7_0.8', '0.8_0.9', '0.9_1.0']  # 原始 PSD
+base_features = ['SBET', 'VT', 'VMI', 'T', 'P']
+target        = 'CO2'
+
+# 转数值
+df[pore_cols + base_features + [target]] = df[pore_cols + base_features + [target]].apply(
+    pd.to_numeric, errors="coerce"
+)
+
+# 衍生特征：微孔比例
+df["Micropore_Ratio"] = df["VMI"] / df["VT"]
+
+# 删除缺失
+need_cols = base_features + pore_cols + ["Micropore_Ratio", target]
+df.dropna(subset=need_cols, inplace=True)
+
+# 最终特征
+features = base_features + ["Micropore_Ratio"] + pore_cols
+
+X = df[features].copy()
+y = df[target].copy()
+
+# （仅 CV 评估用）标准化副本
+scaler_for_cv = StandardScaler()
+X_scaled = pd.DataFrame(
+    scaler_for_cv.fit_transform(X),
+    columns=X.columns,
+    index=X.index
+)
+
+# ===================== 4) Train/Test 划分 + 主模型训练 =====================
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42
+)
+
+model = RandomForestRegressor(n_estimators=200, max_depth=6, random_state=42)
+model.fit(X_train, y_train)
+
+# 训练/测试预测
+y_train_pred = model.predict(X_train)
+y_test_pred  = model.predict(X_test)
+
+# 保存指标（txt 可留，也可删；这里保留）
+tr_metrics = {
+    "RMSE": rmse(y_train, y_train_pred),
+    "MAE": float(mean_absolute_error(y_train, y_train_pred)),
+    "R2":  float(r2_score(y_train, y_train_pred)),
+}
+te_metrics = {
+    "RMSE": rmse(y_test, y_test_pred),
+    "MAE": float(mean_absolute_error(y_test, y_test_pred)),
+    "R2":  float(r2_score(y_test, y_test_pred)),
+}
+with open(os.path.join(OUT_DIR, "metrics.txt"), "w", encoding="utf-8") as f:
+    f.write("RandomForest (RF) metrics\n")
+    f.write(f"Train: RMSE={tr_metrics['RMSE']:.6f}, MAE={tr_metrics['MAE']:.6f}, R2={tr_metrics['R2']:.6f}\n")
+    f.write(f"Test : RMSE={te_metrics['RMSE']:.6f}, MAE={te_metrics['MAE']:.6f}, R2={te_metrics['R2']:.6f}\n")
+
+# =============================================================================
+# (a) RepeatedKFold(5×10) 性能散点 —— 输出 CSV
+# 你原图：X=R2, Y=RMSE, 颜色=STD(残差标准差)
+# =============================================================================
+cv = RepeatedKFold(n_splits=5, n_repeats=10, random_state=123)
+
+rows = []
+fold_id = 0
+for tr_idx, te_idx in cv.split(X_scaled):
+    fold_id += 1
+    X_tr, X_te = X_scaled.iloc[tr_idx], X_scaled.iloc[te_idx]
+    y_tr, y_te = y.iloc[tr_idx], y.iloc[te_idx]
+
+    m = RandomForestRegressor(n_estimators=200, max_depth=6, random_state=42)
+    m.fit(X_tr, y_tr)
+    y_hat = m.predict(X_te)
+
+    r2_v   = float(r2_score(y_te, y_hat))
+    rmse_v = float(rmse(y_te, y_hat))
+    std_v  = float(np.std(np.asarray(y_te) - np.asarray(y_hat)))
+
+    rows.append({"Fold": fold_id, "R2": r2_v, "RMSE": rmse_v, "STD": std_v})
+
+cv_df = pd.DataFrame(rows)
+
+# 额外保存“均值±标准差”，方便你在 Origin 文本框直接用
+summary = {
+    "R2_mean":  float(cv_df["R2"].mean()),
+    "R2_std":   float(cv_df["R2"].std(ddof=1)),
+    "RMSE_mean":float(cv_df["RMSE"].mean()),
+    "RMSE_std": float(cv_df["RMSE"].std(ddof=1)),
+    "STD_mean": float(cv_df["STD"].mean()),
+    "STD_std":  float(cv_df["STD"].std(ddof=1)),
+}
+summary_df = pd.DataFrame([summary])
+
+cv_df.to_csv(os.path.join(OUT_DIR, "A_cv_R2_RMSE_STD_points.csv"), index=False, encoding="utf-8-sig")
+summary_df.to_csv(os.path.join(OUT_DIR, "A_cv_R2_RMSE_STD_summary.csv"), index=False, encoding="utf-8-sig")
+
+# =============================================================================
+# (d) 预测 vs 真实（Parity）—— 输出 CSV
+# 你原图：Train/Test 两组点 + 三条线：y=x、train拟合线、test拟合线
+# =============================================================================
+k_tr, b_tr = fit_line(y_train.values, y_train_pred)
+k_te, b_te = fit_line(y_test.values,  y_test_pred)
+
+# 点数据
+parity_points = pd.DataFrame({
+    "Set": (["Train"] * len(y_train)) + (["Test"] * len(y_test)),
+    "True_CO2": np.concatenate([y_train.values, y_test.values]),
+    "Pred_CO2": np.concatenate([y_train_pred, y_test_pred]),
+})
+
+# 线数据（给 Origin 直接画三条线）
+x_all = np.concatenate([y_train.values, y_test.values, y_train_pred, y_test_pred])
+xy_min, xy_max = float(np.min(x_all)), float(np.max(x_all))
+pad = 0.05 * (xy_max - xy_min) if (xy_max > xy_min) else 1.0
+x_min, x_max = xy_min - pad, xy_max + pad
+xx = np.linspace(x_min, x_max, 200)
+
+parity_lines = pd.DataFrame({
+    "x": xx,
+    "Ideal_y=x": xx,
+    "Train_fit_y": k_tr * xx + b_tr,
+    "Test_fit_y":  k_te * xx + b_te
+})
+
+parity_metrics = pd.DataFrame([{
+    "Train_RMSE": tr_metrics["RMSE"],
+    "Train_MAE":  tr_metrics["MAE"],
+    "Train_R2":   tr_metrics["R2"],
+    "Test_RMSE":  te_metrics["RMSE"],
+    "Test_MAE":   te_metrics["MAE"],
+    "Test_R2":    te_metrics["R2"],
+    "Train_fit_k": k_tr,
+    "Train_fit_b": b_tr,
+    "Test_fit_k":  k_te,
+    "Test_fit_b":  b_te,
+    "x_min": x_min,
+    "x_max": x_max
+}])
+
+parity_points.to_csv(os.path.join(OUT_DIR, "D_parity_points_train_test.csv"), index=False, encoding="utf-8-sig")
+parity_lines.to_csv(os.path.join(OUT_DIR, "D_parity_lines_ideal_trainfit_testfit.csv"), index=False, encoding="utf-8-sig")
+parity_metrics.to_csv(os.path.join(OUT_DIR, "D_parity_metrics_and_fitparams.csv"), index=False, encoding="utf-8-sig")
+
+# =============================================================================
+# (c) SHAP beeswarm —— 输出 CSV（用于 Origin 复刻）
+# 关键：导出 long-format：每个点 = (Feature, SHAP_value, Feature_value)
+# 同时给出特征排序（mean|shap|）和“Sum of other features”聚合（可选）
+# =============================================================================
+# 使用 TreeExplainer 更稳定（对 RF）
+explainer = shap.TreeExplainer(model)
+# shap_values: (n_samples, n_features)
+shap_vals = explainer.shap_values(X_test)
+shap_vals = np.asarray(shap_vals)
+
+# X_test 对应的特征值矩阵
+Xv = X_test.values
+
+# 计算特征重要性（mean(|shap|)）
+mean_abs = np.mean(np.abs(shap_vals), axis=0)
+order_idx = np.argsort(mean_abs)[::-1]  # 降序
+
+ordered_features = [features[i] for i in order_idx]
+ordered_importance = mean_abs[order_idx]
+
+rank_df = pd.DataFrame({
+    "Feature": ordered_features,
+    "MeanAbsSHAP": ordered_importance,
+    "Rank": np.arange(1, len(ordered_features) + 1)
+})
+rank_df.to_csv(os.path.join(OUT_DIR, "C_shap_feature_rank_meanAbs.csv"), index=False, encoding="utf-8-sig")
+
+# long-format 输出：全特征（点很多，文件会大，但最通用）
+# 每个样本*每个特征 一行
+n_samples, n_feat = shap_vals.shape
+feature_col = np.repeat(features, n_samples)               # (n_feat*n_samples,)
+sample_col  = np.tile(np.arange(n_samples), n_feat)       # (n_feat*n_samples,)
+shap_col    = shap_vals.T.reshape(-1)                      # 先按特征堆叠
+fval_col    = Xv.T.reshape(-1)
+
+shap_long_all = pd.DataFrame({
+    "SampleIndex": sample_col.astype(int),
+    "Feature": feature_col,
+    "SHAP_value": shap_col.astype(float),
+    "Feature_value": fval_col.astype(float),
+})
+
+# 给 Origin 用的“Y排序索引”（按 mean|shap| 从大到小）
+rank_map = {feat: (len(features) - i) for i, feat in enumerate(ordered_features)}
+# 例如最重要=最高的 Y_index（方便在 Origin 从上往下排列）
+shap_long_all["Y_index"] = shap_long_all["Feature"].map(rank_map).astype(int)
+
+# 建议你在 Origin 里自己加 Y 抖动：
+# Y_plot = Y_index + (rnd() - 0.5)*0.4
+shap_long_all.to_csv(os.path.join(OUT_DIR, "C_shap_beeswarm_long_ALL_features.csv"),
+                     index=False, encoding="utf-8-sig")
+
+# ——可选：模仿 SHAP 图里 “Sum of other features”（把低重要性特征合并）
+TOP_N = 9  # 你示例图大约显示 9 个+1个“Sum of others”，可自行改
+top_feats = ordered_features[:TOP_N]
+other_feats = ordered_features[TOP_N:]
+
+# 1) top 特征的 long 数据
+shap_long_top = shap_long_all[shap_long_all["Feature"].isin(top_feats)].copy()
+
+# 2) other 合并：对每个样本，把 other 的 shap 相加；feature_value 用 NaN（或用 0）
+if len(other_feats) > 0:
+    other_mask = np.isin(features, other_feats)
+    other_shap_sum = shap_vals[:, other_mask].sum(axis=1)  # (n_samples,)
+    other_row = pd.DataFrame({
+        "SampleIndex": np.arange(n_samples, dtype=int),
+        "Feature": ["Sum_of_other_features"] * n_samples,
+        "SHAP_value": other_shap_sum.astype(float),
+        "Feature_value": np.full(n_samples, np.nan, dtype=float),
+        "Y_index": np.full(n_samples, 1, dtype=int)  # 让它排最底部
+    })
+    # 重新设置 top 的 Y_index：让 top 从上到下是 TOP_N..2，others=1
+    top_rank_map = {feat: (TOP_N - i + 1) for i, feat in enumerate(top_feats)}  # 最高=TOP_N+1
+    shap_long_top["Y_index"] = shap_long_top["Feature"].map(top_rank_map).astype(int)
+
+    shap_long_top_plus = pd.concat([shap_long_top, other_row], ignore_index=True)
+else:
+    # 没有 other 特征
+    top_rank_map = {feat: (TOP_N - i) for i, feat in enumerate(top_feats)}
+    shap_long_top["Y_index"] = shap_long_top["Feature"].map(top_rank_map).astype(int)
+    shap_long_top_plus = shap_long_top
+
+# 同时输出“最终展示顺序表”
+display_order = top_feats + (["Sum_of_other_features"] if len(other_feats) > 0 else [])
+display_df = pd.DataFrame({
+    "DisplayFeature": display_order,
+    "DisplayOrderTopToBottom": np.arange(1, len(display_order) + 1)
+})
+display_df.to_csv(os.path.join(OUT_DIR, "C_shap_display_order_TOPN_plus_others.csv"),
+                  index=False, encoding="utf-8-sig")
+
+shap_long_top_plus.to_csv(os.path.join(OUT_DIR, "C_shap_beeswarm_long_TOPN_plus_others.csv"),
+                          index=False, encoding="utf-8-sig")
+
+print("\n✅ 已完成：仅输出 CSV（不生成图片）")
+print(f"📁 输出目录：{OUT_DIR}")
+print("生成文件：")
+print("  (a) A_cv_R2_RMSE_STD_points.csv, A_cv_R2_RMSE_STD_summary.csv")
+print("  (d) D_parity_points_train_test.csv, D_parity_lines_ideal_trainfit_testfit.csv, D_parity_metrics_and_fitparams.csv")
+print("  (c) C_shap_beeswarm_long_ALL_features.csv, C_shap_feature_rank_meanAbs.csv")
+print("      C_shap_beeswarm_long_TOPN_plus_others.csv, C_shap_display_order_TOPN_plus_others.csv")
