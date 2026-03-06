@@ -16,7 +16,7 @@ warnings.filterwarnings("ignore")
 # =========================
 # 1) 路径
 # =========================
-DATA_PATH = r"C:\Users\26611\Desktop\ml\S\data20250603.csv"
+DATA_PATH = r"C:\Users\26611\Desktop\ml\S\data.csv"
 OUT_DIR   = r"C:\Users\26611\Desktop\ml\DIERCI\ML_FIG\MLP\PSD_DATA"
 os.makedirs(OUT_DIR, exist_ok=True)
 
